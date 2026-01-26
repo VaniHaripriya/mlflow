@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import threading
@@ -10,7 +11,7 @@ from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
 from kubernetes import client, config, watch
-from kubernetes.client import CoreV1Api
+from kubernetes.client import CoreV1Api, CustomObjectsApi
 from kubernetes.client.exceptions import ApiException
 from kubernetes.config.config_exception import ConfigException
 
@@ -23,11 +24,17 @@ from mlflow.protos.databricks_pb2 import (
     RESOURCE_DOES_NOT_EXIST,
 )
 from mlflow.store.workspace.abstract_store import AbstractStore
+from mlflow.utils.uri import append_to_uri_path
 
 _logger = logging.getLogger(__name__)
 
 DEFAULT_DESCRIPTION_ANNOTATION = "mlflow.kubeflow.org/workspace-description"
 DEFAULT_NAMESPACE_EXCLUDE_GLOBS: tuple[str, ...] = ("kube-*", "openshift-*")
+
+# MLflowConfig CRD constants
+MLFLOW_CONFIG_GROUP = "mlflow.opendatahub.io"
+MLFLOW_CONFIG_VERSION = "v1"
+MLFLOW_CONFIG_PLURAL = "mlflowconfigs"
 
 
 def _parse_glob_input(value: Iterable[str] | str | None) -> tuple[str, ...] | None:
@@ -94,6 +101,15 @@ class KubernetesWorkspaceProviderConfig:
 class NamespaceInfo:
     name: str
     description: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MLflowConfigInfo:
+    """Stores MLflowConfig CRD data for a namespace."""
+
+    namespace: str
+    artifact_root_path: str | None
+    artifact_root_secret: str | None
 
 
 class NamespaceCache:
@@ -262,6 +278,178 @@ class NamespaceCache:
         return any(fnmatchcase(name, pattern) for pattern in self._namespace_exclude_globs)
 
 
+class MLflowConfigCache:
+    """Caches MLflowConfig CRDs using a watch loop."""
+
+    def __init__(self, api: CustomObjectsApi):
+        self._api = api
+        self._lock = threading.RLock()
+        self._configs: dict[str, MLflowConfigInfo] = {}
+        self._resource_version: str | None = None
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+        self._crd_available = True
+        self._crd_missing_logged = False
+
+        self._refresh_full()
+
+        self._thread = threading.Thread(
+            target=self._run,
+            name="mlflow-k8s-config-watch",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def get_config(self, namespace: str) -> MLflowConfigInfo | None:
+        """Get MLflowConfig for a namespace, or None if not found."""
+        self._wait_until_ready()
+        with self._lock:
+            return self._configs.get(namespace)
+
+    def _wait_until_ready(self) -> None:
+        if self._ready_event.wait(timeout=30):
+            return
+        raise MlflowException(
+            "Timed out waiting for MLflowConfig cache to initialize.",
+            INTERNAL_ERROR,
+        )
+
+    def _refresh_full(self) -> None:
+        try:
+            response = self._api.list_cluster_custom_object(
+                group=MLFLOW_CONFIG_GROUP,
+                version=MLFLOW_CONFIG_VERSION,
+                plural=MLFLOW_CONFIG_PLURAL,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                # CRD not installed - this is okay, MLflowConfig is optional
+                if not self._crd_missing_logged:
+                    _logger.info(
+                        "MLflowConfig CRD not installed. Artifact root overrides disabled. "
+                        "Install the CRD to enable per-namespace artifact storage configuration."
+                    )
+                    self._crd_missing_logged = True
+                self._crd_available = False
+            elif exc.status == 403:
+                _logger.warning(
+                    "Permission denied listing MLflowConfig CRDs. "
+                    "Ensure RBAC allows 'list' and 'watch' on mlflowconfigs.mlflow.opendatahub.io"
+                )
+                self._crd_available = False
+            else:
+                _logger.warning(f"Failed to list MLflowConfig CRDs: {exc}")
+            self._ready_event.set()
+            return
+
+        items = response.get("items", [])
+        metadata = response.get("metadata", {})
+        resource_version = metadata.get("resourceVersion")
+
+        with self._lock:
+            self._configs = {}
+            for item in items:
+                info = self._extract_info(item)
+                if info:
+                    self._configs[info.namespace] = info
+            self._resource_version = resource_version
+
+        self._ready_event.set()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            # If CRD is not available, sleep and periodically retry
+            if not self._crd_available:
+                # Retry checking for CRD every 5 minutes in case it gets installed later
+                self._stop_event.wait(timeout=300)
+                if not self._stop_event.is_set():
+                    self._crd_available = True  # Reset to retry
+                    self._resource_version = None
+                continue
+
+            if self._resource_version is None:
+                try:
+                    self._refresh_full()
+                except Exception:
+                    _logger.warning("Failed to refresh MLflowConfig; retrying", exc_info=True)
+                    time.sleep(2)
+                    continue
+
+            # Skip watch if CRD became unavailable during refresh
+            if not self._crd_available:
+                continue
+
+            watcher = watch.Watch()
+            try:
+                for event in watcher.stream(
+                    self._api.list_cluster_custom_object,
+                    group=MLFLOW_CONFIG_GROUP,
+                    version=MLFLOW_CONFIG_VERSION,
+                    plural=MLFLOW_CONFIG_PLURAL,
+                    resource_version=self._resource_version,
+                    timeout_seconds=300,
+                ):
+                    if self._stop_event.is_set():
+                        watcher.stop()
+                        break
+                    self._handle_event(event)
+            except ApiException as exc:
+                if exc.status == 410:
+                    _logger.debug("MLflowConfig watch expired; resyncing")
+                    self._resource_version = None
+                elif exc.status in (404, 403):
+                    # CRD removed or permissions revoked
+                    self._crd_available = False
+                else:
+                    _logger.warning("MLflowConfig watch error: %s", exc)
+                    time.sleep(2)
+            except Exception:
+                _logger.exception("Unexpected error in MLflowConfig watch loop")
+                time.sleep(2)
+            else:
+                time.sleep(1)
+
+    def _handle_event(self, event: dict) -> None:
+        event_type = event.get("type")
+        obj = event.get("object", {})
+        metadata = obj.get("metadata", {})
+        namespace = metadata.get("namespace")
+        resource_version = metadata.get("resourceVersion")
+
+        if not namespace:
+            return
+
+        with self._lock:
+            if event_type in {"ADDED", "MODIFIED"}:
+                info = self._extract_info(obj)
+                if info:
+                    self._configs[namespace] = info
+                self._resource_version = resource_version
+            elif event_type == "DELETED":
+                self._configs.pop(namespace, None)
+                self._resource_version = resource_version
+            elif event_type == "BOOKMARK":
+                self._resource_version = resource_version or self._resource_version
+            elif event_type == "ERROR":
+                self._resource_version = None
+
+    def _extract_info(self, obj: dict) -> MLflowConfigInfo | None:
+        metadata = obj.get("metadata", {})
+        namespace = metadata.get("namespace")
+        if not namespace:
+            return None
+
+        spec = obj.get("spec", {})
+        return MLflowConfigInfo(
+            namespace=namespace,
+            artifact_root_path=spec.get("artifactRootPath"),
+            artifact_root_secret=spec.get("artifactRootSecret"),
+        )
+
+
 class KubernetesWorkspaceProvider(AbstractStore):
     """Workspace provider that maps MLflow workspaces to Kubernetes namespaces."""
 
@@ -281,12 +469,13 @@ class KubernetesWorkspaceProvider(AbstractStore):
             namespace_exclude_globs=namespace_exclude_globs,
         )
 
-        self._core_api = self._create_api_client(self._config)
+        self._core_api, self._custom_api = self._create_api_clients()
         self._namespace_cache = NamespaceCache(
             self._core_api,
             self._config.label_selector,
             self._config.namespace_exclude_globs,
         )
+        self._mlflow_config_cache = MLflowConfigCache(self._custom_api)
 
     def list_workspaces(self) -> Iterable[Workspace]:  # type: ignore[override]
         infos = self._namespace_cache.list_namespaces()
@@ -325,8 +514,108 @@ class KubernetesWorkspaceProvider(AbstractStore):
             )
         return self.get_workspace(self._config.default_workspace)
 
+    def resolve_artifact_root(
+        self, default_artifact_root: str, workspace_name: str | None = None
+    ) -> tuple[str, bool]:
+        """
+        Resolve the artifact root for a workspace.
+
+        If an MLflowConfig CRD exists for the namespace with artifactRootSecret set,
+        read the bucket information from the Secret and construct the artifact root.
+        If artifactRootPath is also set, append it to the bucket URI.
+
+        Returns:
+            A tuple (artifact_root, should_append_workspace_prefix).
+        """
+        if not workspace_name:
+            return default_artifact_root, True
+
+        mlflow_config = self._mlflow_config_cache.get_config(workspace_name)
+        if not mlflow_config or not mlflow_config.artifact_root_secret:
+            # No override configured - use default behavior
+            return default_artifact_root, True
+
+        # Read the Secret to get bucket information
+        try:
+            bucket_uri = self._get_bucket_uri_from_secret(
+                workspace_name, mlflow_config.artifact_root_secret
+            )
+        except Exception as exc:
+            _logger.warning(
+                f"Failed to read Secret '{mlflow_config.artifact_root_secret}' "
+                f"in namespace '{workspace_name}': {exc}. Using default artifact root."
+            )
+            return default_artifact_root, True
+
+        if not bucket_uri:
+            _logger.warning(
+                f"Secret '{mlflow_config.artifact_root_secret}' in namespace "
+                f"'{workspace_name}' does not contain valid bucket information. "
+                "Using default artifact root."
+            )
+            return default_artifact_root, True
+
+        # If artifactRootPath is set, validate and append it to the bucket URI
+        if mlflow_config.artifact_root_path:
+            path = mlflow_config.artifact_root_path.strip()
+
+            # Validate the path
+            if not path:
+                _logger.warning(
+                    f"MLflowConfig in namespace '{workspace_name}' has empty artifactRootPath. "
+                    "Using bucket root."
+                )
+            elif ".." in path:
+                _logger.warning(
+                    f"MLflowConfig in namespace '{workspace_name}' has invalid artifactRootPath "
+                    f"'{path}' (contains '..'). Using default artifact root for security."
+                )
+                return default_artifact_root, True
+            else:
+                # Remove leading slash if present (path should be relative)
+                path = path.lstrip("/")
+                if path:
+                    bucket_uri = append_to_uri_path(bucket_uri, path)
+
+        return bucket_uri, False
+
+    def _get_bucket_uri_from_secret(self, namespace: str, secret_name: str) -> str | None:
+        """
+        Read bucket information from a Secret and construct the bucket URI.
+
+        Returns:
+            The bucket URI in s3:// format (e.g., 's3://bucket-name'),
+            or None if the Secret doesn't contain valid bucket information.
+        """     
+
+        try:
+            secret = self._core_api.read_namespaced_secret(
+                name=secret_name,
+                namespace=namespace,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                _logger.warning(f"Secret '{secret_name}' not found in namespace '{namespace}'")
+                return None
+            raise
+
+        data = secret.data or {}
+        
+        def decode(key: str) -> str | None:
+            value = data.get(key)
+            if value:
+                return base64.b64decode(value).decode("utf-8")
+            return None
+
+        bucket = decode("AWS_S3_BUCKET")
+        if not bucket:
+            return None
+        
+        return f"s3://{bucket}"
+
     @staticmethod
-    def _create_api_client(config_values: KubernetesWorkspaceProviderConfig) -> CoreV1Api:
+    def _create_api_clients() -> tuple[CoreV1Api, CustomObjectsApi]:
+        """Load Kubernetes config and create API clients."""
         try:
             config.load_incluster_config()
         except ConfigException:
@@ -337,7 +626,7 @@ class KubernetesWorkspaceProvider(AbstractStore):
                     "Failed to load Kubernetes configuration for workspace provider",
                     error_code=INVALID_STATE,
                 ) from exc
-        return client.CoreV1Api()
+        return client.CoreV1Api(), client.CustomObjectsApi()
 
 
 def _parse_workspace_uri_options(
